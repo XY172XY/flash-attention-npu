@@ -222,7 +222,9 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
         uint32_t embed = actualOriShape[COORD_DIM2];
 
         GemmCoord actualShape{rowNum, 0, embed};
+        GemmCoord nextActualShape{rowNum, 0, embed};
         uint32_t gBOffset = 0;
+        uint32_t nextGBOffset = 0;
 
         LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(rowNum, embed);
 
@@ -248,7 +250,6 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                     // writeback is page-aware.
                     getBlockShape(actualShape, nL1Idx, nL1Loop, stackSeqTile);
                     getKVOffset(gBOffset, nIdx, nL1Idx, strideKV);
-                    mActual = actualShape.m();
                     kActual = actualShape.k();
                     nActual = actualShape.n();
                     layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(kActual, nActual);
@@ -282,18 +283,32 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                     nActual = l1NResDynamic;
                 }
             } else {
-                getBlockShape(actualShape, nL1Idx, nL1Loop, stackSeqTile);
-                getKVOffset(gBOffset, nIdx, nL1Idx, strideKV);
-                mActual = actualShape.m();
-                kActual = actualShape.k();
-                nActual = actualShape.n();
-                layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(kActual, nActual);
+                if (nL1Idx == 0) {
+                    getBlockShape(actualShape, nL1Idx, nL1Loop, stackSeqTile);
+                    getKVOffset(gBOffset, nIdx, nL1Idx, strideKV);
+                    kActual = actualShape.k();
+                    nActual = actualShape.n();
+                    layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(kActual, nActual);
+                    auto layoutBTile = layoutB.GetTileLayout(MakeCoord(kActual, nActual));
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1KPingPongFlag);
+                    copyGmToL1B(l1BTensor[l1KPingPongFlag], gB[gBOffset], layoutBInL1, layoutBTile);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1KPingPongFlag);
+                }
 
-                auto layoutBTile = layoutB.GetTileLayout(MakeCoord(kActual, nActual));
-                AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1KPingPongFlag);
-                copyGmToL1B(l1BTensor[l1KPingPongFlag], gB[gBOffset], layoutBInL1, layoutBTile);
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1KPingPongFlag);
                 writebackK(gB, gBOffset, nL1Idx, nActual, kActual, strideKV);
+
+                if (nL1Idx + 1 < nL1Loop) {
+                    getBlockShape(nextActualShape, nL1Idx + 1, nL1Loop, stackSeqTile);
+                    getKVOffset(nextGBOffset, nIdx, nL1Idx + 1, strideKV);
+                    uint32_t nextKActual = nextActualShape.k();
+                    uint32_t nextNActual = nextActualShape.n();
+                    LayoutBInL1 nextLayoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(nextKActual, nextNActual);
+                    auto layoutBTile = layoutB.GetTileLayout(MakeCoord(nextKActual, nextNActual));
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(pingPongState->l1PingPongFlag);
+                    copyGmToL1B(l1BTensor[pingPongState->l1PingPongFlag], gB[nextGBOffset], nextLayoutBInL1,
+                                layoutBTile);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(pingPongState->l1PingPongFlag);
+                }
             }
             uint32_t mL0Loop = CeilDiv(mActual, L0TileShape::M);
             uint32_t kL0Loop = CeilDiv(kActual, L0TileShape::K);
@@ -342,6 +357,13 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                 auto layoutInL0C = LayoutCInL0::MakeLayoutInL0C(MakeCoord(mL0Actual, nActual));
                 copyL0CToGm(gC[layoutC.GetOffset(gmCTileCoord)], l0CTensor[l0CPingPongFlag], layoutCTile, layoutInL0C);
                 AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CPingPongFlag);
+            }
+            if constexpr (PAGED_CACHE_FLAG_) {
+            } else {
+                if (nL1Idx + 1 < nL1Loop) {
+                    actualShape = nextActualShape;
+                    gBOffset = nextGBOffset;
+                }
             }
         }
     }
