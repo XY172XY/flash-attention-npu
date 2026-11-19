@@ -202,7 +202,9 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                       AscendC::GlobalTensor<ElementB> gBCache = AscendC::GlobalTensor<ElementB>(),
                                       uint64_t cacheRowBase = 0,
                                       AscendC::GlobalTensor<int32_t> gCacheTable = AscendC::GlobalTensor<int32_t>(),
-                                      uint32_t cachePageSize = 0, uint32_t cacheTableBase = 0, uint32_t qL1Offset = 0)
+                                      uint32_t cachePageSize = 0, uint32_t cacheTableBase = 0, uint32_t qL1Offset = 0,
+                                      bool firstTilePreloaded = false, bool preloadNextCall = false,
+                                      AscendC::GlobalTensor<ElementB> gNextB = AscendC::GlobalTensor<ElementB>())
     {
         (void)doCopyback;
         (void)gBCache;
@@ -290,9 +292,11 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                     nActual = actualShape.n();
                     layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(kActual, nActual);
                     auto layoutBTile = layoutB.GetTileLayout(MakeCoord(kActual, nActual));
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1KPingPongFlag);
-                    copyGmToL1B(l1BTensor[l1KPingPongFlag], gB[gBOffset], layoutBInL1, layoutBTile);
-                    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1KPingPongFlag);
+                    if (!firstTilePreloaded) {
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1KPingPongFlag);
+                        copyGmToL1B(l1BTensor[l1KPingPongFlag], gB[gBOffset], layoutBInL1, layoutBTile);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1KPingPongFlag);
+                    }
                 }
 
                 writebackK(gB, gBOffset, nL1Idx, nActual, kActual, strideKV);
@@ -307,6 +311,16 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(pingPongState->l1PingPongFlag);
                     copyGmToL1B(l1BTensor[pingPongState->l1PingPongFlag], gB[nextGBOffset], nextLayoutBInL1,
                                 layoutBTile);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(pingPongState->l1PingPongFlag);
+                } else if (preloadNextCall) {
+                    uint32_t nextNActual = (stackSeqTile < l1NDynamic) ? stackSeqTile : l1NDynamic;
+                    uint32_t nextGBOffset = 0;
+                    getKVOffset(nextGBOffset, nIdx, 0, strideKV);
+                    LayoutBInL1 nextLayoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(embed, nextNActual);
+                    auto nextLayoutBTile = layoutB.GetTileLayout(MakeCoord(embed, nextNActual));
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(pingPongState->l1PingPongFlag);
+                    copyGmToL1B(l1BTensor[pingPongState->l1PingPongFlag], gNextB[nextGBOffset], nextLayoutBInL1,
+                                nextLayoutBTile);
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(pingPongState->l1PingPongFlag);
                 }
             }
